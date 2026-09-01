@@ -1,0 +1,15 @@
+{
+  "name": "thrive-whatsapp-automation",
+  "version": "1.0.0",
+  "description": "WhatsApp Automation Dashboard for Thrive - MMT Consulting",
+  "private": true,
+  "workspaces": [
+    "frontend",
+    "backend"
+  ],
+  "scripts": {
+    "dev:backend": "cd backend && npm run dev",
+    "dev:frontend": "cd frontend && npm run dev",
+    "install:all": "cd backend && npm install && cd ../frontend && npm install"
+  }
+}
