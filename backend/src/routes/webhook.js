@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+const { classifyMessage } = require('../services/classifier');
 
 /**
  * WhatsApp Webhook
@@ -31,9 +32,16 @@ router.post('/', (req, res) => {
       entry.changes?.forEach(change => {
         const value = change.value;
         if (value.messages) {
-          value.messages.forEach(msg => {
-            console.log('[Webhook] Inbound message:', JSON.stringify(msg, null, 2));
-            // TODO: Save to DB / emit via websocket to frontend
+          value.messages.forEach(async msg => {
+            const body = msg.text?.body || msg.button?.text || '';
+            const classification = await classifyMessage({
+              id: msg.id,
+              direction: 'inbound',
+              body,
+              contactId: msg.from,
+            });
+            console.log('[Webhook] Inbound message:', msg.id, '→', classification);
+            // TODO: Save { ...msg, ...classification } to DB / emit via websocket to frontend
           });
         }
       });
