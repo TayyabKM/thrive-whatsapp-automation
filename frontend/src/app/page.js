@@ -1,13 +1,14 @@
 'use client';
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { MessageCircle } from 'lucide-react';
 import { api } from '@/lib/api';
+import LoginGate from '@/components/LoginGate';
 import InboxSummary from '@/components/InboxSummary';
 import StatsGrid from '@/components/StatsGrid';
 import ConversationList from '@/components/ConversationList';
 import MessageFeed from '@/components/MessageFeed';
 
-export default function Dashboard() {
+function DashboardContent() {
   const [stats, setStats] = useState(null);
   const [summary, setSummary] = useState(null);
   const [conversations, setConversations] = useState(null);
@@ -16,6 +17,8 @@ export default function Dashboard() {
   const [filter, setFilter] = useState('all');
   const [search, setSearch] = useState('');
   const [lastRefresh, setLastRefresh] = useState(new Date());
+  const [health, setHealth] = useState(null);
+  const [live, setLive] = useState(false); // SSE connection state
 
   const loadStats = useCallback(async () => {
     try { const r = await api.getStats(); setStats(r.data); } catch {}
@@ -38,32 +41,51 @@ export default function Dashboard() {
     } catch {}
   }, [filter, search, selectedContact]);
 
+  const refreshAll = useCallback(() => {
+    loadStats();
+    loadSummary();
+    loadConversations();
+    loadMessages();
+    setLastRefresh(new Date());
+  }, [loadStats, loadSummary, loadConversations, loadMessages]);
+
   // Initial load
   useEffect(() => {
     loadStats();
     loadSummary();
     loadConversations();
+    fetch(`${api.apiUrl}/health`).then(r => r.json()).then(setHealth).catch(() => {});
   }, []);
 
   // Reload messages when filter/search/contact changes
   useEffect(() => { loadMessages(); }, [loadMessages]);
 
-  // Auto-refresh every 30s
+  // 30s poll — a safety net; SSE below handles the real-time path
   useEffect(() => {
-    const t = setInterval(() => {
-      loadStats();
-      loadSummary();
-      loadConversations();
-      loadMessages();
-      setLastRefresh(new Date());
-    }, 30000);
+    const t = setInterval(refreshAll, 30000);
     return () => clearInterval(t);
-  }, [loadStats, loadSummary, loadConversations, loadMessages]);
+  }, [refreshAll]);
+
+  // Live updates: the backend pushes an SSE event the moment a webhook
+  // message lands or a reply is sent, so the dashboard doesn't wait on the poll.
+  const refreshAllRef = useRef(refreshAll);
+  refreshAllRef.current = refreshAll;
+
+  useEffect(() => {
+    const key = api.getKey();
+    const url = `${api.apiUrl}/api/events${key ? `?key=${encodeURIComponent(key)}` : ''}`;
+    const es = new EventSource(url);
+    es.onopen = () => setLive(true);
+    es.onerror = () => setLive(false);
+    es.addEventListener('message', () => refreshAllRef.current());
+    return () => { es.close(); setLive(false); };
+  }, []);
+
+  const unreadCount = stats?.unreadMessages ?? 0;
+  const activeContact = conversations?.find(c => c.contact.id === selectedContact)?.contact ?? null;
 
   const [mounted, setMounted] = useState(false);
   useEffect(() => { setMounted(true); }, []);
-
-  const unreadCount = stats?.unreadMessages ?? 0;
 
   return (
     <div className="min-h-screen bg-slate-100">
@@ -88,7 +110,10 @@ export default function Dashboard() {
           <span className="text-xs text-gray-400" suppressHydrationWarning>
             {mounted ? `Updated ${lastRefresh.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : ''}
           </span>
-          <div className="w-2 h-2 bg-green-400 rounded-full" title="Connected (mock)" />
+          <div
+            className={`w-2 h-2 rounded-full ${live ? 'bg-green-400' : 'bg-gray-300'}`}
+            title={live ? 'Live updates connected' : 'Live updates disconnected — polling every 30s'}
+          />
         </div>
       </header>
 
@@ -123,9 +148,7 @@ export default function Dashboard() {
           <div className="bg-white rounded-xl border border-gray-200 flex flex-col overflow-hidden">
             <div className="px-4 py-3 border-b border-gray-100">
               <h2 className="font-semibold text-gray-800 text-sm">
-                {selectedContact
-                  ? `Chat — ${conversations?.find(c => c.contact.id === selectedContact)?.contact?.name ?? '...'}`
-                  : 'All Messages'}
+                {activeContact ? `Chat — ${activeContact.name}` : 'All Messages'}
               </h2>
             </div>
             <MessageFeed
@@ -134,6 +157,8 @@ export default function Dashboard() {
               search={search}
               onFilterChange={setFilter}
               onSearchChange={setSearch}
+              activeContact={activeContact}
+              onSent={refreshAll}
             />
           </div>
 
@@ -165,15 +190,34 @@ export default function Dashboard() {
               <div className="pt-2 border-t border-gray-100">
                 <p className="text-xs text-gray-500 mb-2 font-medium">Connection Status</p>
                 <div className="flex items-center gap-2 text-xs">
-                  <span className="w-2 h-2 bg-yellow-400 rounded-full" />
-                  <span className="text-gray-600">Mock mode — API not connected</span>
+                  <span className={`w-2 h-2 rounded-full ${health?.whatsappLive ? 'bg-green-400' : 'bg-yellow-400'}`} />
+                  <span className="text-gray-600">
+                    {health ? (health.whatsappLive ? 'Connected to WhatsApp Cloud API' : 'Mock mode — API not connected') : 'Checking…'}
+                  </span>
                 </div>
-                <p className="text-xs text-gray-400 mt-1">Plug in your WhatsApp API token in <code className="bg-gray-100 px-1 rounded">backend/.env</code></p>
+                {!health?.whatsappLive && (
+                  <p className="text-xs text-gray-400 mt-1">
+                    Plug in your WhatsApp API token in <code className="bg-gray-100 px-1 rounded">backend/.env</code>
+                  </p>
+                )}
+                {health && !health.authRequired && (
+                  <p className="text-xs text-gray-400 mt-1">
+                    No dashboard key set — set <code className="bg-gray-100 px-1 rounded">DASHBOARD_API_KEY</code> before deploying.
+                  </p>
+                )}
               </div>
             </div>
           </div>
         </div>
       </main>
     </div>
+  );
+}
+
+export default function Dashboard() {
+  return (
+    <LoginGate>
+      <DashboardContent />
+    </LoginGate>
   );
 }
