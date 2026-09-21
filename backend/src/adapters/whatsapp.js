@@ -1,42 +1,61 @@
 /**
  * WhatsApp Adapter
  * ─────────────────────────────────────────────────────────────────────────────
- * This file is the ONLY place that talks to the WhatsApp API.
- * Currently returns mock data. To go live:
- *   1. Set WHATSAPP_API_TOKEN and WHATSAPP_PHONE_NUMBER_ID in backend/.env
- *   2. Replace each function body with real API calls (Meta / Twilio / etc.)
- *   3. Keep the same return shapes — the rest of the app needs no changes.
+ * The only place that talks to the WhatsApp API and the message store.
+ *
+ * Inbound messages arrive via the webhook (Meta pushes them — there's no bulk
+ * "list messages" endpoint) and are persisted in ./store.js. sendMessage calls
+ * the real Graph API when WHATSAPP_API_TOKEN + WHATSAPP_PHONE_NUMBER_ID are
+ * set; otherwise it mocks the send but still persists the message, so the UI
+ * works identically either way.
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
-const MOCK_CONTACTS = [
-  { id: 'c1', name: 'Ahmed Raza', phone: '+923001234567', avatar: 'AR', isImportant: true },
-  { id: 'c2', name: 'Sana Malik', phone: '+923219876543', avatar: 'SM', isImportant: false },
-  { id: 'c3', name: 'Bilal Khan', phone: '+923451112233', avatar: 'BK', isImportant: true },
-  { id: 'c4', name: 'Fatima Sheikh', phone: '+923331234567', avatar: 'FS', isImportant: false },
-  { id: 'c5', name: 'Usman Ali', phone: '+923125550199', avatar: 'UA', isImportant: false },
-  { id: 'c6', name: 'Nadia Hussain', phone: '+923456789012', avatar: 'NH', isImportant: true },
-];
+const store = require('../store');
+const bus = require('../services/bus');
+const { classifyMany, classifierMode } = require('../services/classifier');
+const { summarizeInbox } = require('../services/summarizer');
 
-const MOCK_MESSAGES = [
-  { id: 'm1', contactId: 'c1', direction: 'inbound', body: 'Assalam o Alaikum! I wanted to follow up on the committee meeting scheduled for next week. Can we confirm the venue?', timestamp: new Date(Date.now() - 1000 * 60 * 5).toISOString(), status: 'read', isImportant: true, tags: ['meeting', 'committee'] },
-  { id: 'm2', contactId: 'c1', direction: 'outbound', body: 'Walaikum Assalam! Yes, the venue is confirmed — Serena Hotel, Hall 3. I\'ll send the formal invite shortly.', timestamp: new Date(Date.now() - 1000 * 60 * 4).toISOString(), status: 'delivered', isImportant: false, tags: [] },
-  { id: 'm3', contactId: 'c2', direction: 'inbound', body: 'The budget proposal has been revised. Please review the attached document before Friday.', timestamp: new Date(Date.now() - 1000 * 60 * 30).toISOString(), status: 'unread', isImportant: true, tags: ['budget', 'urgent'] },
-  { id: 'm4', contactId: 'c3', direction: 'inbound', body: 'We need to discuss the quarterly report. Are you available tomorrow afternoon around 3pm?', timestamp: new Date(Date.now() - 1000 * 60 * 60).toISOString(), status: 'read', isImportant: true, tags: ['meeting'] },
-  { id: 'm5', contactId: 'c3', direction: 'outbound', body: 'Tomorrow at 3pm works perfectly. I\'ll set up a call link and share it with you.', timestamp: new Date(Date.now() - 1000 * 60 * 55).toISOString(), status: 'read', isImportant: false, tags: [] },
-  { id: 'm6', contactId: 'c4', direction: 'inbound', body: 'Just checking in — the subcommittee members have been notified about the policy changes.', timestamp: new Date(Date.now() - 1000 * 60 * 120).toISOString(), status: 'read', isImportant: false, tags: ['subcommittee'] },
-  { id: 'm7', contactId: 'c5', direction: 'inbound', body: 'Reminder: membership fees collection deadline is this Sunday. Should we send a bulk reminder?', timestamp: new Date(Date.now() - 1000 * 60 * 180).toISOString(), status: 'unread', isImportant: true, tags: ['finance', 'deadline'] },
-  { id: 'm8', contactId: 'c6', direction: 'inbound', body: 'The event decorations vendor has confirmed. They need a 50% advance payment by Wednesday.', timestamp: new Date(Date.now() - 1000 * 60 * 240).toISOString(), status: 'unread', isImportant: true, tags: ['event', 'payment'] },
-  { id: 'm9', contactId: 'c2', direction: 'outbound', body: 'Thanks Sana, I will review and get back to you by EOD.', timestamp: new Date(Date.now() - 1000 * 60 * 25).toISOString(), status: 'delivered', isImportant: false, tags: [] },
-  { id: 'm10', contactId: 'c6', direction: 'inbound', body: 'Also, the caterer is asking for the final headcount. Can you confirm by tomorrow morning?', timestamp: new Date(Date.now() - 1000 * 60 * 235).toISOString(), status: 'unread', isImportant: true, tags: ['event', 'catering'] },
-];
+// ── AI enrichment ────────────────────────────────────────────────────────────
+// Classifies any inbound message that doesn't have a priority yet, then
+// persists the result to the store — so it only ever runs once per message,
+// even across restarts.
+let classifying = false;
+async function ensureClassified() {
+  if (classifying) return;
+  const messages = store.getMessages();
+  const contacts = store.getContacts();
+  const toClassify = messages.filter(m => m.direction === 'inbound' && m.priority === undefined);
+  if (!toClassify.length) return;
 
-// ── Public API (replace these bodies with real API calls) ─────────────────────
+  classifying = true;
+  try {
+    const withContact = toClassify.map(m => ({ ...m, contact: contacts.find(c => c.id === m.contactId) }));
+    const results = await classifyMany(withContact);
+    for (const m of toClassify) {
+      const r = results.get(m.id) || { isImportant: false, priority: 'low', reason: '', tags: [], source: 'rule' };
+      store.updateMessage(m.id, {
+        isImportant: r.isImportant,
+        priority: r.priority,
+        importanceReason: r.reason,
+        importanceSource: r.source,
+        tags: r.tags,
+      });
+    }
+    console.log(`[Classifier] Tagged ${toClassify.length} message(s) via ${classifierMode()}`);
+  } catch (err) {
+    console.error('[Classifier] enrichment failed:', err.message);
+  } finally {
+    classifying = false;
+  }
+}
+
+// ── Public API ──────────────────────────────────────────────────────────────
 
 async function getMessages({ filter = 'all', search = '', limit = 50 } = {}) {
-  // TODO: Replace with real API call
-  // e.g. await axios.get(`${process.env.WHATSAPP_API_BASE}/messages`, { headers: { Authorization: `Bearer ${process.env.WHATSAPP_API_TOKEN}` } })
-  let messages = [...MOCK_MESSAGES].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+  await ensureClassified();
+  const contacts = store.getContacts();
+  let messages = [...store.getMessages()].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 
   if (filter === 'unread') messages = messages.filter(m => m.status === 'unread');
   if (filter === 'important') messages = messages.filter(m => m.isImportant);
@@ -45,14 +64,17 @@ async function getMessages({ filter = 'all', search = '', limit = 50 } = {}) {
 
   return messages.slice(0, limit).map(m => ({
     ...m,
-    contact: MOCK_CONTACTS.find(c => c.id === m.contactId),
+    contact: contacts.find(c => c.id === m.contactId),
   }));
 }
 
 async function getConversations() {
-  // Returns one entry per contact with their latest message
-  const conversations = MOCK_CONTACTS.map(contact => {
-    const msgs = MOCK_MESSAGES
+  await ensureClassified();
+  const contacts = store.getContacts();
+  const allMessages = store.getMessages();
+
+  const conversations = contacts.map(contact => {
+    const msgs = allMessages
       .filter(m => m.contactId === contact.id)
       .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
     const latest = msgs[0];
@@ -64,17 +86,30 @@ async function getConversations() {
 }
 
 async function getStats() {
-  const total = MOCK_MESSAGES.length;
-  const unread = MOCK_MESSAGES.filter(m => m.status === 'unread').length;
-  const important = MOCK_MESSAGES.filter(m => m.isImportant).length;
-  const inbound = MOCK_MESSAGES.filter(m => m.direction === 'inbound').length;
-  const outbound = MOCK_MESSAGES.filter(m => m.direction === 'outbound').length;
+  await ensureClassified();
+  const messages = store.getMessages();
+  const contacts = store.getContacts();
+
+  const total = messages.length;
+  const unread = messages.filter(m => m.status === 'unread').length;
+  const important = messages.filter(m => m.isImportant).length;
+  const inbound = messages.filter(m => m.direction === 'inbound').length;
+  const outbound = messages.filter(m => m.direction === 'outbound').length;
 
   const today = new Date();
-  const todayMsgs = MOCK_MESSAGES.filter(m => {
+  const todayMsgs = messages.filter(m => {
     const d = new Date(m.timestamp);
     return d.getDate() === today.getDate() && d.getMonth() === today.getMonth();
   });
+
+  const needsReply = messages.filter(m => m.direction === 'inbound' && m.status === 'unread');
+  const urgentUnread = needsReply.filter(m => m.isImportant).length;
+  const oldestUnread = needsReply
+    .map(m => new Date(m.timestamp).getTime())
+    .sort((a, b) => a - b)[0];
+  const oldestUnreadMinutes = oldestUnread ? Math.round((Date.now() - oldestUnread) / 60000) : null;
+
+  const status = urgentUnread > 0 ? 'attention' : unread > 0 ? 'pending' : 'clear';
 
   return {
     totalMessages: total,
@@ -83,37 +118,89 @@ async function getStats() {
     inboundMessages: inbound,
     outboundMessages: outbound,
     todayMessages: todayMsgs.length,
-    activeContacts: MOCK_CONTACTS.length,
-    responseRate: Math.round((outbound / inbound) * 100),
+    activeContacts: contacts.length,
+    responseRate: inbound ? Math.round((outbound / inbound) * 100) : 0,
+    needsReply: needsReply.length,
+    urgentUnread,
+    oldestUnreadMinutes,
+    status,
   };
 }
 
 async function getSummary() {
-  // TODO: Replace with AI-generated summary (e.g. OpenAI / Claude API)
+  await ensureClassified();
+  const stats = await getStats();
+  const { overview, unreadDigest, source } = await summarizeInbox({
+    messages: store.getMessages(),
+    contacts: store.getContacts(),
+    stats,
+  });
+
   return {
     generatedAt: new Date().toISOString(),
-    highlights: [
-      { priority: 'high', text: 'Budget proposal from Sana Malik needs review before Friday.' },
-      { priority: 'high', text: 'Event vendor requires 50% advance payment by Wednesday — Nadia Hussain.' },
-      { priority: 'high', text: 'Membership fees collection deadline is this Sunday — bulk reminder pending.' },
-      { priority: 'medium', text: 'Quarterly report call scheduled with Bilal Khan tomorrow at 3pm.' },
-      { priority: 'medium', text: 'Caterer needs final headcount confirmation by tomorrow morning.' },
-      { priority: 'low', text: 'Committee meeting venue confirmed: Serena Hotel, Hall 3.' },
-    ],
-    pendingActions: [
-      'Review revised budget proposal (Sana Malik)',
-      'Approve advance payment for event vendor (Nadia Hussain)',
-      'Confirm caterer headcount',
-      'Send membership fee reminder to members',
-    ],
+    classifier: classifierMode(),
+    summarizer: source,
+    overview,
+    unreadDigest,
   };
 }
 
-async function sendMessage({ to, body }) {
-  // TODO: Replace with real send API
-  // e.g. await axios.post(`${process.env.WHATSAPP_API_BASE}/messages`, { messaging_product: 'whatsapp', to, type: 'text', text: { body } }, ...)
-  console.log(`[WhatsApp Adapter] MOCK send to ${to}: ${body}`);
-  return { success: true, messageId: `mock_${Date.now()}`, timestamp: new Date().toISOString() };
+function isLiveConfigured() {
+  return !!(process.env.WHATSAPP_API_TOKEN && process.env.WHATSAPP_PHONE_NUMBER_ID);
 }
 
-module.exports = { getMessages, getConversations, getStats, getSummary, sendMessage };
+async function sendMessage({ to, body }) {
+  let contact = store.findContactByPhone(to);
+  if (!contact) {
+    contact = store.upsertContact({
+      id: `c_${Date.now()}`,
+      name: to,
+      phone: to,
+      avatar: to.slice(-2).toUpperCase(),
+      type: 'individual',
+      isImportant: false,
+    });
+  }
+
+  let result;
+  if (isLiveConfigured()) {
+    try {
+      const res = await fetch(`${process.env.WHATSAPP_API_BASE}/${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${process.env.WHATSAPP_API_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ messaging_product: 'whatsapp', to, type: 'text', text: { body } }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error?.message || `Graph API ${res.status}`);
+      result = { success: true, messageId: data.messages?.[0]?.id || `wa_${Date.now()}`, timestamp: new Date().toISOString(), live: true };
+    } catch (err) {
+      console.error('[WhatsApp Adapter] Live send failed:', err.message);
+      result = { success: false, error: err.message, live: true };
+    }
+  } else {
+    console.log(`[WhatsApp Adapter] MOCK send to ${to}: ${body}`);
+    result = { success: true, messageId: `mock_${Date.now()}`, timestamp: new Date().toISOString(), live: false };
+  }
+
+  const message = store.addMessage({
+    id: result.messageId || `m_${Date.now()}`,
+    contactId: contact.id,
+    direction: 'outbound',
+    body,
+    timestamp: new Date().toISOString(),
+    status: result.success ? 'delivered' : 'failed',
+    isImportant: false,
+    priority: 'low',
+    importanceReason: '',
+    importanceSource: 'rule',
+    tags: [],
+  });
+  bus.emit('message', { ...message, contact });
+
+  return result;
+}
+
+module.exports = { getMessages, getConversations, getStats, getSummary, sendMessage, isLiveConfigured };

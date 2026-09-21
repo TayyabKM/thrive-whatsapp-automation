@@ -1,5 +1,8 @@
 'use client';
+import { useState } from 'react';
+import { Star, Sparkles, Settings2, MessagesSquare, Send, Loader2 } from 'lucide-react';
 import { timeAgo } from '@/lib/utils';
+import { api } from '@/lib/api';
 
 function TagBadge({ tag }) {
   return (
@@ -21,12 +24,29 @@ function MessageBubble({ message }) {
           isOut
             ? 'bg-green-500 text-white rounded-br-sm'
             : 'bg-white text-gray-800 border border-gray-200 rounded-bl-sm'
-        } ${message.isImportant ? 'ring-2 ring-yellow-400' : ''}`}>
+        } ${message.isImportant ? 'ring-2 ring-amber-400' : ''}`}>
           {message.isImportant && (
-            <span className="absolute -top-2 -right-2 text-sm">⭐</span>
+            <Star className="absolute -top-2 -right-2 w-4 h-4 text-amber-500 fill-amber-400" />
           )}
           {message.body}
         </div>
+        {message.isImportant && message.importanceReason && (
+          <div className="mt-1 px-1 flex items-center gap-1.5 max-w-full">
+            <span className={`text-[10px] font-bold uppercase px-1.5 py-0.5 rounded ${
+              message.priority === 'high' ? 'bg-red-100 text-red-700'
+              : message.priority === 'medium' ? 'bg-amber-100 text-amber-700'
+              : 'bg-gray-100 text-gray-600'
+            }`}>
+              {message.priority}
+            </span>
+            <span className="text-[11px] text-gray-500 italic truncate flex items-center gap-1" title={message.importanceReason}>
+              {message.importanceSource === 'llm'
+                ? <Sparkles className="w-3 h-3 flex-shrink-0" />
+                : <Settings2 className="w-3 h-3 flex-shrink-0" />}
+              {message.importanceReason}
+            </span>
+          </div>
+        )}
         <div className={`flex items-center gap-2 mt-1 px-1 ${isOut ? 'flex-row-reverse' : ''}`}>
           <span className="text-xs text-gray-400">{timeAgo(message.timestamp)}</span>
           {message.tags?.map(t => <TagBadge key={t} tag={t} />)}
@@ -36,7 +56,62 @@ function MessageBubble({ message }) {
   );
 }
 
-export default function MessageFeed({ messages, filter, search, onFilterChange, onSearchChange }) {
+function Composer({ contact, onSent }) {
+  const [text, setText] = useState('');
+  const [sending, setSending] = useState(false);
+  const [error, setError] = useState('');
+  const isGroup = contact.type === 'group';
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (!text.trim() || sending) return;
+    setSending(true);
+    setError('');
+    try {
+      const res = await api.sendMessage(contact.phone, text.trim());
+      if (!res.data?.success) throw new Error(res.data?.error || 'Send failed');
+      setText('');
+      onSent?.();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSending(false);
+    }
+  };
+
+  if (isGroup) {
+    return (
+      <div className="px-4 py-3 border-t border-gray-100 text-xs text-gray-400 flex-shrink-0">
+        Replies to group chats aren&apos;t supported by the WhatsApp Cloud API — reply to an individual instead.
+      </div>
+    );
+  }
+
+  return (
+    <form onSubmit={submit} className="px-4 py-3 border-t border-gray-100 flex-shrink-0">
+      <div className="flex items-center gap-2">
+        <input
+          type="text"
+          placeholder={`Message ${contact.name}…`}
+          value={text}
+          onChange={e => setText(e.target.value)}
+          disabled={sending}
+          className="flex-1 text-sm border border-gray-200 rounded-lg px-3 py-2 outline-none focus:border-green-400 bg-gray-50 disabled:opacity-60"
+        />
+        <button
+          type="submit"
+          disabled={sending || !text.trim()}
+          className="bg-green-500 text-white rounded-lg p-2 disabled:opacity-40 hover:bg-green-600 transition-colors flex-shrink-0"
+        >
+          {sending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+        </button>
+      </div>
+      {error && <p className="text-xs text-red-600 mt-1">{error}</p>}
+    </form>
+  );
+}
+
+export default function MessageFeed({ messages, filter, search, onFilterChange, onSearchChange, activeContact, onSent }) {
   return (
     <div className="flex flex-col h-full">
       {/* Toolbar */}
@@ -72,13 +147,15 @@ export default function MessageFeed({ messages, filter, search, onFilterChange, 
           </div>
         ) : messages.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-full text-gray-400">
-            <span className="text-4xl mb-2">💬</span>
+            <MessagesSquare className="w-10 h-10 mb-2" />
             <p className="text-sm">No messages found</p>
           </div>
         ) : (
           messages.map(msg => <MessageBubble key={msg.id} message={msg} />)
         )}
       </div>
+
+      {activeContact && <Composer contact={activeContact} onSent={onSent} />}
     </div>
   );
 }

@@ -18,6 +18,9 @@ backend/.env
 dist/
 build/
 
+# Local message store (persisted mock/live data)
+backend/data/
+
 # OS
 .DS_Store
 Thumbs.db
